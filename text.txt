@@ -1,0 +1,957 @@
+struktur folder project waste detection Backend
+waste-detection-backend/
+├── app/
+│   ├── __init__.py
+│   ├── main.py
+│   ├── config.py
+│   ├── models/
+│   │   ├── __init__.py
+│   │   ├── detection.py
+│   │   └── response.py
+│   ├── services/
+│   │   ├── __init__.py
+│   │   ├── detection_service.py
+│   │   └── image_service.py
+│   ├── api/
+│   │   ├── __init__.py
+│   │   ├── routes/
+│   │   │   ├── __init__.py
+│   │   │   ├── detection.py
+│   │   │   └── health.py
+│   │   └── dependencies.py
+│   ├── core/
+│   │   ├── __init__.py
+│   │   └── exceptions.py
+│   └── utils/
+│       ├── __init__.py
+│       ├── image_utils.py
+│       └── logger.py
+├── models/
+│   └── model.onnx (copy dari Google Colab)
+├── uploads/
+├── requirements.txt
+├── .env
+└── run.py
+
+full code :
+app >
+1. main.py :
+import os
+from contextlib import asynccontextmanager
+from fastapi import FastAPI, Request, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.middleware.trustedhost import TrustedHostMiddleware
+from fastapi.responses import JSONResponse
+from fastapi.staticfiles import StaticFiles
+import time
+
+from app.config import settings
+from app.api.routes import detection, health
+from app.core.exceptions import WasteDetectionException
+from app.utils.logger import get_logger
+from app.services.detection_service import detection_service
+
+logger = get_logger()
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Application lifespan events"""
+    # Startup
+    logger.info(f"Starting {settings.app_name} v{settings.app_version}")
+    
+    # Ensure model is loaded
+    if not detection_service.is_model_loaded():
+        logger.warning("Model not loaded during startup")
+    else:
+        logger.info("Model loaded successfully")
+    
+    # Create upload directory
+    os.makedirs(settings.upload_dir, exist_ok=True)
+    
+    yield
+    
+    # Shutdown
+    logger.info("Shutting down application")
+
+# Create FastAPI app
+app = FastAPI(
+    title=settings.app_name,
+    description="API for waste detection using YOLOv8 model",
+    version=settings.app_version,
+    docs_url="/docs" if settings.debug else None,
+    redoc_url="/redoc" if settings.debug else None,
+    lifespan=lifespan
+)
+
+# Add CORS middleware
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=settings.allowed_origins,
+    allow_credentials=True,
+    allow_methods=["GET", "POST"],
+    allow_headers=["*"],
+)
+
+# Add trusted host middleware (security)
+if not settings.debug:
+    app.add_middleware(
+        TrustedHostMiddleware,
+        allowed_hosts=["localhost", "127.0.0.1", "*.yourdomain.com"]
+    )
+
+# Request logging middleware
+@app.middleware("http")
+async def log_requests(request: Request, call_next):
+    start_time = time.time()
+    
+    # Log request
+    logger.info(f"Request: {request.method} {request.url}")
+    
+    response = await call_next(request)
+    
+    # Log response
+    process_time = time.time() - start_time
+    logger.info(f"Response: {response.status_code} - {process_time:.3f}s")
+    
+    return response
+
+# Exception handlers
+@app.exception_handler(WasteDetectionException)
+async def waste_detection_exception_handler(request: Request, exc: WasteDetectionException):
+    return JSONResponse(
+        status_code=exc.status_code,
+        content=exc.detail
+    )
+
+@app.exception_handler(HTTPException)
+async def http_exception_handler(request: Request, exc: HTTPException):
+    return JSONResponse(
+        status_code=exc.status_code,
+        content={
+            "success": False,
+            "error": exc.detail,
+            "error_code": "HTTP_ERROR"
+        }
+    )
+
+@app.exception_handler(Exception)
+async def general_exception_handler(request: Request, exc: Exception):
+    logger.error(f"Unhandled exception: {exc}")
+    return JSONResponse(
+        status_code=500,
+        content={
+            "success": False,
+            "error": "Internal server error",
+            "error_code": "INTERNAL_ERROR"
+        }
+    )
+
+# Include routers
+app.include_router(health.router, tags=["Health"])
+app.include_router(
+    detection.router, 
+    prefix="/api/v1/detection", 
+    tags=["Detection"]
+)
+
+# Mount static files (optional)
+if os.path.exists("static"):
+    app.mount("/static", StaticFiles(directory="static"), name="static")
+
+2. config.py :
+import os
+from typing import List
+from pydantic_settings import BaseSettings
+from pydantic import Field
+
+class Settings(BaseSettings):
+    # App Settings
+    app_name: str = Field(default="Waste Detection API")
+    app_version: str = Field(default="1.0.0")
+    debug: bool = Field(default=False)
+    host: str = Field(default="0.0.0.0")
+    port: int = Field(default=8000)
+    
+    # Model Settings
+    model_path: str = Field(default="./models/model.onnx")
+    confidence_threshold: float = Field(default=0.5, ge=0.0, le=1.0)
+    iou_threshold: float = Field(default=0.45, ge=0.0, le=1.0)
+    image_size: int = Field(default=640)
+    
+    # Upload Settings
+    upload_dir: str = Field(default="./uploads")
+    max_file_size: int = Field(default=10 * 1024 * 1024)  # 10MB
+    allowed_extensions: List[str] = Field(default=["jpg", "jpeg", "png", "bmp", "webp"])
+    
+    # Firebase Settings (optional)
+    firebase_credentials_path: str = Field(default="")
+    firebase_storage_bucket: str = Field(default="")
+    
+    # CORS Settings
+    allowed_origins: List[str] = Field(default=["http://localhost:3000"])
+    
+    # Rate Limiting
+    rate_limit_per_minute: int = Field(default=30)
+    
+    class Config:
+        env_file = ".env"
+        case_sensitive = False
+
+# Global settings instance
+settings = Settings()
+
+# Ensure upload directory exists
+os.makedirs(settings.upload_dir, exist_ok=True)
+
+app > api >
+1. dependencies :
+from fastapi import Depends, HTTPException, Request
+from fastapi.security import HTTPBearer
+from typing import Optional
+import time
+from collections import defaultdict
+from app.config import settings
+from app.utils.logger import get_logger
+
+logger = get_logger()
+
+# Simple in-memory rate limiter
+rate_limiter = defaultdict(list)
+security = HTTPBearer(auto_error=False)
+
+def get_client_ip(request: Request) -> str:
+    """Get client IP address"""
+    forwarded = request.headers.get("X-Forwarded-For")
+    if forwarded:
+        return forwarded.split(',')[0].strip()
+    return request.client.host
+
+def rate_limit_check(request: Request) -> bool:
+    """Simple rate limiting check"""
+    client_ip = get_client_ip(request)
+    current_time = time.time()
+    
+    # Clean old entries (older than 1 minute)
+    cutoff_time = current_time - 60
+    rate_limiter[client_ip] = [
+        timestamp for timestamp in rate_limiter[client_ip] 
+        if timestamp > cutoff_time
+    ]
+    
+    # Check rate limit
+    if len(rate_limiter[client_ip]) >= settings.rate_limit_per_minute:
+        return False
+    
+    # Add current request
+    rate_limiter[client_ip].append(current_time)
+    return True
+
+def check_rate_limit(request: Request):
+    """Rate limiting dependency"""
+    if not rate_limit_check(request):
+        logger.warning(f"Rate limit exceeded for IP: {get_client_ip(request)}")
+        raise HTTPException(
+            status_code=429, 
+            detail="Rate limit exceeded. Please try again later."
+        )
+
+# Optional authentication dependency (implement if needed)
+def get_current_user(token: Optional[str] = Depends(security)):
+    """Get current user (placeholder for authentication)"""
+    # Implement your authentication logic here
+    # For now, just return None (no authentication required)
+    return None
+
+app > api > routes
+1. detection.py :
+import time
+from fastapi import APIRouter, UploadFile, File, Form, HTTPException, Depends
+from typing import Optional
+from app.models.response import DetectionResponse, ErrorResponse
+from app.models.detection import DetectionRequest, Detection, BoundingBox
+from app.services.detection_service import detection_service
+from app.services.image_service import image_service
+from app.utils.logger import get_logger
+from app.utils.image_utils import load_image_from_bytes
+
+router = APIRouter()
+logger = get_logger()
+
+@router.post("/detect", response_model=DetectionResponse)
+async def detect_waste(
+    file: UploadFile = File(..., description="Image file to analyze"),
+    confidence_threshold: Optional[float] = Form(None, ge=0.0, le=1.0),
+    iou_threshold: Optional[float] = Form(None, ge=0.0, le=1.0),
+    return_image: bool = Form(True, description="Return annotated image")
+):
+    """
+    Detect waste objects in uploaded image
+    
+    - **file**: Image file (JPG, PNG, BMP, WebP)
+    - **confidence_threshold**: Minimum confidence score (0.0-1.0)
+    - **iou_threshold**: IoU threshold for NMS (0.0-1.0)
+    - **return_image**: Whether to return annotated image
+    """
+    start_time = time.time()
+    
+    try:
+        logger.info(f"Processing detection request for file: {file.filename}")
+        
+        # Process uploaded file
+        image_bytes, image_info = await image_service.process_upload_file(file)
+        
+        # Load image for detection
+        image = load_image_from_bytes(image_bytes)
+        if image is None:
+            raise HTTPException(status_code=400, detail="Failed to load image")
+        
+        # Run detection
+        detections = detection_service.detect(
+            image, 
+            confidence_threshold=confidence_threshold,
+            iou_threshold=iou_threshold
+        )
+        
+        # Convert detections to response format
+        detection_objects = []
+        for det in detections:
+            bbox = BoundingBox(
+                x1=det['bbox'][0],
+                y1=det['bbox'][1], 
+                x2=det['bbox'][2],
+                y2=det['bbox'][3]
+            )
+            detection_obj = Detection(
+                class_id=det['class_id'],
+                class_name=det['class_name'],
+                confidence=det['confidence'],
+                bbox=bbox
+            )
+            detection_objects.append(detection_obj)
+        
+        # Create annotated image if requested
+        annotated_image_b64 = None
+        if return_image and detections:
+            annotated_image_b64 = image_service.create_annotated_image(image_bytes, detections)
+        
+        # Calculate processing time
+        processing_time = time.time() - start_time
+        
+        logger.info(f"Detection completed in {processing_time:.3f}s, found {len(detections)} objects")
+        
+        return DetectionResponse(
+            success=True,
+            message=f"Detection completed successfully. Found {len(detections)} objects.",
+            detections=detection_objects,
+            detection_count=len(detections),
+            processing_time=processing_time,
+            image_info=image_info,
+            annotated_image=annotated_image_b64
+        )
+        
+    except Exception as e:
+        processing_time = time.time() - start_time
+        logger.error(f"Detection failed after {processing_time:.3f}s: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@router.get("/model/info")
+async def get_model_info():
+    """Get information about the loaded model"""
+    return {
+        "model_loaded": detection_service.is_model_loaded(),
+        "model_path": settings.model_path,
+        "image_size": settings.image_size,
+        "confidence_threshold": settings.confidence_threshold,
+        "iou_threshold": settings.iou_threshold,
+        "class_names": detection_service.class_names
+    }
+
+2. health.py : 
+from fastapi import APIRouter
+from app.models.response import HealthResponse
+from app.services.detection_service import detection_service
+from app.config import settings
+
+router = APIRouter()
+
+@router.get("/health", response_model=HealthResponse)
+async def health_check():
+    """Health check endpoint"""
+    model_status = detection_service.is_model_loaded()
+    
+    status = "healthy" if model_status else "degraded"
+    message = "Service is running normally" if model_status else "Model not loaded"
+    
+    return HealthResponse(
+        status=status,
+        message=message,
+        model_loaded=model_status,
+        version=settings.app_version
+    )
+
+@router.get("/")
+async def root():
+    """Root endpoint"""
+    return {
+        "message": f"Welcome to {settings.app_name}",
+        "version": settings.app_version,
+        "status": "running"
+    }
+
+app > core
+exceptions.py :
+from fastapi import HTTPException
+from typing import Any, Dict, Optional
+
+class WasteDetectionException(HTTPException):
+    def __init__(
+        self,
+        status_code: int,
+        message: str,
+        error_code: str = "GENERIC_ERROR",
+        details: Optional[Dict[str, Any]] = None
+    ):
+        self.error_code = error_code
+        self.details = details or {}
+        super().__init__(status_code=status_code, detail={
+            "message": message,
+            "error_code": error_code,
+            "details": self.details
+        })
+
+class ModelNotLoadedException(WasteDetectionException):
+    def __init__(self):
+        super().__init__(
+            status_code=503,
+            message="Detection model is not loaded",
+            error_code="MODEL_NOT_LOADED"
+        )
+
+class InvalidImageException(WasteDetectionException):
+    def __init__(self, details: str = ""):
+        super().__init__(
+            status_code=400,
+            message="Invalid image format or corrupted image",
+            error_code="INVALID_IMAGE",
+            details={"details": details}
+        )
+
+class FileSizeExceededException(WasteDetectionException):
+    def __init__(self, max_size: int):
+        super().__init__(
+            status_code=413,
+            message=f"File size exceeds maximum allowed size of {max_size} bytes",
+            error_code="FILE_SIZE_EXCEEDED",
+            details={"max_size": max_size}
+        )
+
+class UnsupportedFileTypeException(WasteDetectionException):
+    def __init__(self, allowed_types: list):
+        super().__init__(
+            status_code=415,
+            message="Unsupported file type",
+            error_code="UNSUPPORTED_FILE_TYPE",
+            details={"allowed_types": allowed_types}
+        )
+app > models
+1. detection.py :
+from pydantic import BaseModel, Field
+from typing import List, Optional
+from datetime import datetime
+
+class BoundingBox(BaseModel):
+    x1: float = Field(..., description="Left coordinate")
+    y1: float = Field(..., description="Top coordinate") 
+    x2: float = Field(..., description="Right coordinate")
+    y2: float = Field(..., description="Bottom coordinate")
+    
+class Detection(BaseModel):
+    class_id: int = Field(..., description="Class ID")
+    class_name: str = Field(..., description="Class name")
+    confidence: float = Field(..., ge=0.0, le=1.0, description="Confidence score")
+    bbox: BoundingBox = Field(..., description="Bounding box coordinates")
+
+class DetectionRequest(BaseModel):
+    confidence_threshold: Optional[float] = Field(default=None, ge=0.0, le=1.0)
+    iou_threshold: Optional[float] = Field(default=None, ge=0.0, le=1.0)
+    return_image: bool = Field(default=True, description="Return annotated image")
+
+2. response.py :
+from pydantic import BaseModel, Field
+from typing import List, Optional, Dict, Any
+from datetime import datetime
+from .detection import Detection
+
+class DetectionResponse(BaseModel):
+    success: bool = Field(..., description="Request success status")
+    message: str = Field(..., description="Response message")
+    detections: List[Detection] = Field(..., description="List of detections")
+    detection_count: int = Field(..., description="Total number of detections")
+    processing_time: float = Field(..., description="Processing time in seconds")
+    image_info: Dict[str, Any] = Field(..., description="Original image information")
+    annotated_image: Optional[str] = Field(None, description="Base64 encoded annotated image")
+    timestamp: datetime = Field(default_factory=datetime.now)
+
+class HealthResponse(BaseModel):
+    status: str = Field(..., description="API status")
+    message: str = Field(..., description="Health message")
+    timestamp: datetime = Field(default_factory=datetime.now)
+    model_loaded: bool = Field(..., description="Model loading status")
+    version: str = Field(..., description="API version")
+
+class ErrorResponse(BaseModel):
+    success: bool = Field(default=False)
+    error: str = Field(..., description="Error message")
+    error_code: str = Field(..., description="Error code")
+    timestamp: datetime = Field(default_factory=datetime.now)
+
+app > services
+1. detection_service :
+import onnxruntime as ort
+import numpy as np
+from typing import List, Dict, Tuple, Optional
+from app.config import settings
+from app.utils.logger import get_logger
+from app.core.exceptions import ModelNotLoadedException
+import cv2
+
+logger = get_logger()
+
+class WasteDetectionService:
+    def __init__(self):
+        self.session: Optional[ort.InferenceSession] = None
+        self.input_name: str = ""
+        self.output_name: str = ""
+        self.class_names = {
+            0: "organic",      # Sampah organik
+            1: "inorganic"     # Sampah anorganik
+        }
+        self.load_model()
+    
+    def load_model(self) -> bool:
+        """Load ONNX model"""
+        try:
+            logger.info(f"Loading model from: {settings.model_path}")
+            
+            # Use GPU if available, else CPU
+            providers = ['CPUExecutionProvider']
+            if 'CUDAExecutionProvider' in ort.get_available_providers():
+                providers.insert(0, 'CUDAExecutionProvider')
+                logger.info("Using CUDAExecutionProvider (GPU)")
+            else:
+                logger.info("Using CPUExecutionProvider")
+            
+            self.session = ort.InferenceSession(settings.model_path, providers=providers)
+            self.input_name = self.session.get_inputs()[0].name
+            self.output_name = self.session.get_outputs()[0].name
+            
+            logger.info(f"Model loaded successfully. Input: {self.input_name}, Output: {self.output_name}")
+            return True
+        
+        except Exception as e:
+            logger.error(f"Failed to load model: {e}")
+            self.session = None
+            return False
+    
+    def is_model_loaded(self) -> bool:
+        return self.session is not None
+    
+    def detect(self, image: np.ndarray, confidence_threshold: float = None, iou_threshold: float = None) -> List[Dict]:
+        """Run YOLO ONNX detection"""
+        if not self.is_model_loaded():
+            raise ModelNotLoadedException()
+        
+        conf_thresh = confidence_threshold or settings.confidence_threshold
+        iou_thresh = iou_threshold or settings.iou_threshold
+        
+        try:
+            model_input, scale = self._preprocess_image(image)
+            
+            outputs = self.session.run([self.output_name], {self.input_name: model_input})
+            
+            detections = self._postprocess_outputs(outputs[0], scale, conf_thresh, iou_thresh)
+            logger.info(f"Detected {len(detections)} objects")
+            return detections
+        
+        except Exception as e:
+            logger.error(f"Detection failed: {e}")
+            return []
+    
+    def _preprocess_image(self, image: np.ndarray) -> Tuple[np.ndarray, float]:
+        """Resize and normalize image for YOLO ONNX"""
+        height, width = image.shape[:2]
+        target_size = settings.image_size
+        
+        scale = min(target_size / width, target_size / height)
+        new_width = int(width * scale)
+        new_height = int(height * scale)
+        
+        resized_image = cv2.resize(image, (new_width, new_height))
+        padded_image = np.full((target_size, target_size, 3), 114, dtype=np.uint8)
+        
+        y_offset = (target_size - new_height) // 2
+        x_offset = (target_size - new_width) // 2
+        padded_image[y_offset:y_offset + new_height, x_offset:x_offset + new_width] = resized_image
+        
+        normalized_image = padded_image.astype(np.float32) / 255.0
+        model_input = np.transpose(normalized_image, (2, 0, 1))
+        model_input = np.expand_dims(model_input, axis=0)
+        
+        return model_input, scale
+    
+    def _postprocess_outputs(self, outputs: np.ndarray, scale: float, conf_thresh: float, iou_thresh: float) -> List[Dict]:
+        """Convert YOLO raw outputs [1, 6, 8400] to final boxes"""
+        detections = []
+        output = np.squeeze(outputs)  # [6, 8400]
+        preds = output.T              # [8400, 6]
+        
+        # Each row: x_center, y_center, w, h, confidence, class_id
+        boxes = preds[:, :4]
+        scores = preds[:, 4]
+        class_ids = preds[:, 5].astype(int)
+        
+        # Filter by confidence
+        valid = scores > conf_thresh
+        boxes = boxes[valid]
+        scores = scores[valid]
+        class_ids = class_ids[valid]
+        
+        if len(boxes) == 0:
+            return []
+        
+        # Convert to corner format
+        x_center, y_center, w, h = boxes.T
+        x1 = x_center - w / 2
+        y1 = y_center - h / 2
+        x2 = x_center + w / 2
+        y2 = y_center + h / 2
+        boxes_corner = np.stack([x1, y1, x2, y2], axis=1)
+        
+        # Apply NMS
+        indices = cv2.dnn.NMSBoxes(boxes_corner.tolist(), scores.tolist(), conf_thresh, iou_thresh)
+        
+        if len(indices) > 0:
+            for idx in indices.flatten():
+                x1, y1, x2, y2 = boxes_corner[idx]
+                x1, y1, x2, y2 = x1 / scale, y1 / scale, x2 / scale, y2 / scale
+                
+                detections.append({
+                    "class_id": int(class_ids[idx]),
+                    "class_name": self.class_names.get(int(class_ids[idx]), "unknown"),
+                    "confidence": float(scores[idx]),
+                    "bbox": [float(x1), float(y1), float(x2), float(y2)]
+                })
+        
+        return detections
+
+
+# Global detection service instance
+detection_service = WasteDetectionService()
+
+2. image_service.py :
+import os
+import aiofiles
+from fastapi import UploadFile
+from typing import Tuple, Optional
+from app.config import settings
+from app.utils.logger import get_logger
+from app.utils.image_utils import (
+    validate_image, load_image_from_bytes, 
+    draw_detections, encode_image_to_base64, get_image_info
+)
+from app.core.exceptions import (
+    InvalidImageException, FileSizeExceededException, 
+    UnsupportedFileTypeException
+)
+
+logger = get_logger()
+
+class ImageService:
+    def __init__(self):
+        self.upload_dir = settings.upload_dir
+        self.max_file_size = settings.max_file_size
+        self.allowed_extensions = settings.allowed_extensions
+    
+    async def validate_upload_file(self, file: UploadFile) -> None:
+        """Validate uploaded file"""
+        # Check file size
+        if file.size > self.max_file_size:
+            raise FileSizeExceededException(self.max_file_size)
+        
+        # Check file extension
+        if file.filename:
+            extension = file.filename.split('.')[-1].lower()
+            if extension not in self.allowed_extensions:
+                raise UnsupportedFileTypeException(self.allowed_extensions)
+    
+    async def process_upload_file(self, file: UploadFile) -> Tuple[bytes, dict]:
+        """Process uploaded file and return image bytes and info"""
+        try:
+            # Validate file
+            await self.validate_upload_file(file)
+            
+            # Read file content
+            file_content = await file.read()
+            
+            # Validate image content
+            if not validate_image(file_content):
+                raise InvalidImageException("Invalid or corrupted image file")
+            
+            # Load image to get info
+            image = load_image_from_bytes(file_content)
+            if image is None:
+                raise InvalidImageException("Failed to load image")
+            
+            # Get image info
+            image_info = get_image_info(image)
+            image_info.update({
+                "filename": file.filename,
+                "content_type": file.content_type,
+                "file_size": file.size
+            })
+            
+            return file_content, image_info
+            
+        except Exception as e:
+            logger.error(f"Failed to process upload file: {e}")
+            if isinstance(e, (InvalidImageException, FileSizeExceededException, UnsupportedFileTypeException)):
+                raise
+            raise InvalidImageException(f"File processing error: {str(e)}")
+    
+    def create_annotated_image(self, image_bytes: bytes, detections: list) -> Optional[str]:
+        """Create annotated image with detection results"""
+        try:
+            # Load image
+            image = load_image_from_bytes(image_bytes)
+            if image is None:
+                return None
+            
+            # Draw detections
+            annotated_image = draw_detections(image, detections, {})
+            
+            # Encode to base64
+            return encode_image_to_base64(annotated_image)
+            
+        except Exception as e:
+            logger.error(f"Failed to create annotated image: {e}")
+            return None
+    
+    async def save_temp_file(self, file_content: bytes, filename: str) -> str:
+        """Save file temporarily (optional for debugging)"""
+        try:
+            file_path = os.path.join(self.upload_dir, filename)
+            async with aiofiles.open(file_path, 'wb') as f:
+                await f.write(file_content)
+            return file_path
+        except Exception as e:
+            logger.error(f"Failed to save temp file: {e}")
+            raise
+    
+    def cleanup_temp_file(self, file_path: str) -> None:
+        """Clean up temporary file"""
+        try:
+            if os.path.exists(file_path):
+                os.remove(file_path)
+        except Exception as e:
+            logger.error(f"Failed to cleanup temp file: {e}")
+
+# Global image service instance
+image_service = ImageService()
+
+app > utils
+1. image_utils.py :
+import cv2
+import numpy as np
+import base64
+from io import BytesIO
+from PIL import Image
+from typing import Tuple, Optional
+from app.utils.logger import get_logger
+
+logger = get_logger()
+
+def validate_image(image_bytes: bytes) -> bool:
+    """Validate if bytes represent a valid image"""
+    try:
+        image = Image.open(BytesIO(image_bytes))
+        image.verify()
+        return True
+    except Exception as e:
+        logger.error(f"Image validation failed: {e}")
+        return False
+
+def load_image_from_bytes(image_bytes: bytes) -> Optional[np.ndarray]:
+    """Load image from bytes and convert to OpenCV format"""
+    try:
+        # Convert bytes to PIL Image
+        image = Image.open(BytesIO(image_bytes))
+        
+        # Convert to RGB if necessary
+        if image.mode != 'RGB':
+            image = image.convert('RGB')
+        
+        # Convert to numpy array
+        image_array = np.array(image)
+        
+        # Convert RGB to BGR for OpenCV
+        image_bgr = cv2.cvtColor(image_array, cv2.COLOR_RGB2BGR)
+        
+        return image_bgr
+    except Exception as e:
+        logger.error(f"Failed to load image from bytes: {e}")
+        return None
+
+def preprocess_image(image: np.ndarray, target_size: int = 640) -> Tuple[np.ndarray, float]:
+    """Preprocess image for YOLO model"""
+    try:
+        # Get original dimensions
+        height, width = image.shape[:2]
+        
+        # Calculate scaling factor
+        scale = min(target_size / width, target_size / height)
+        
+        # Resize image
+        new_width = int(width * scale)
+        new_height = int(height * scale)
+        resized_image = cv2.resize(image, (new_width, new_height))
+        
+        # Create padded image
+        padded_image = np.full((target_size, target_size, 3), 114, dtype=np.uint8)
+        
+        # Calculate padding offsets
+        y_offset = (target_size - new_height) // 2
+        x_offset = (target_size - new_width) // 2
+        
+        # Place resized image in center
+        padded_image[y_offset:y_offset + new_height, x_offset:x_offset + new_width] = resized_image
+        
+        # Normalize and convert to float32
+        normalized_image = padded_image.astype(np.float32) / 255.0
+        
+        # Convert to CHW format and add batch dimension
+        model_input = np.transpose(normalized_image, (2, 0, 1))
+        model_input = np.expand_dims(model_input, axis=0)
+        
+        return model_input, scale
+    except Exception as e:
+        logger.error(f"Image preprocessing failed: {e}")
+        raise
+
+def draw_detections(image: np.ndarray, detections: list, class_names: dict) -> np.ndarray:
+    """Draw bounding boxes and labels on image"""
+    try:
+        annotated_image = image.copy()
+        
+        # Define colors for different classes
+        colors = {
+            'organic': (0, 255, 0),      # Green
+            'anorganik': (0, 0, 255),    # Red
+            'inorganic': (0, 0, 255),    # Red (alternative)
+        }
+        
+        for detection in detections:
+            x1, y1, x2, y2 = detection['bbox']
+            class_name = detection['class_name'].lower()
+            confidence = detection['confidence']
+            
+            # Get color for this class
+            color = colors.get(class_name, (255, 0, 0))  # Default blue
+            
+            # Draw bounding box
+            cv2.rectangle(annotated_image, (int(x1), int(y1)), (int(x2), int(y2)), color, 2)
+            
+            # Create label
+            label = f"{detection['class_name']}: {confidence:.2f}"
+            
+            # Get text size
+            (text_width, text_height), baseline = cv2.getTextSize(
+                label, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1
+            )
+            
+            # Draw label background
+            cv2.rectangle(
+                annotated_image,
+                (int(x1), int(y1) - text_height - 10),
+                (int(x1) + text_width, int(y1)),
+                color,
+                -1
+            )
+            
+            # Draw label text
+            cv2.putText(
+                annotated_image,
+                label,
+                (int(x1), int(y1) - 5),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.5,
+                (255, 255, 255),
+                1
+            )
+        
+        return annotated_image
+    except Exception as e:
+        logger.error(f"Failed to draw detections: {e}")
+        return image
+
+def encode_image_to_base64(image: np.ndarray, format: str = 'JPEG') -> str:
+    """Encode OpenCV image to base64 string"""
+    try:
+        # Convert BGR to RGB
+        image_rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+        
+        # Convert to PIL Image
+        pil_image = Image.fromarray(image_rgb)
+        
+        # Save to BytesIO
+        buffer = BytesIO()
+        pil_image.save(buffer, format=format, quality=85)
+        
+        # Encode to base64
+        base64_string = base64.b64encode(buffer.getvalue()).decode('utf-8')
+        
+        return f"data:image/{format.lower()};base64,{base64_string}"
+    except Exception as e:
+        logger.error(f"Failed to encode image to base64: {e}")
+        raise
+
+def get_image_info(image: np.ndarray) -> dict:
+    """Get basic information about an image"""
+    height, width, channels = image.shape
+    return {
+        "width": width,
+        "height": height,
+        "channels": channels,
+        "size_bytes": image.nbytes
+    }
+.env :
+# ============================================================================
+# FILE 2: .env
+# ============================================================================
+
+# Application Settings
+APP_NAME="Waste Detection API"
+APP_VERSION="1.0.0"
+DEBUG=True
+HOST=0.0.0.0
+PORT=8000
+
+# Model Settings
+MODEL_PATH="./models/model.onnx"
+CONFIDENCE_THRESHOLD=0.1
+IOU_THRESHOLD=0.45
+IMAGE_SIZE=640
+
+# Upload Settings
+UPLOAD_DIR="./uploads"
+MAX_FILE_SIZE=10485760  # 10MB in bytes
+ALLOWED_EXTENSIONS=["jpg","jpeg","png","bmp,webp"]
+
+# Firebase Settings (optional)
+# FIREBASE_CREDENTIALS_PATH="./firebase-credentials.json"
+# FIREBASE_STORAGE_BUCKET="your-project.appspot.com"
+
+# CORS Settings
+ALLOWED_ORIGINS=["*"]
+
+# Rate Limiting
+RATE_LIMIT_PER_MINUTE=30

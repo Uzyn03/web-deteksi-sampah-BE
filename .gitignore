@@ -1,0 +1,44 @@
+# ----- Python -----
+# Virtual environment
+venv/
+env/
+.venv/
+
+# Byte-compiled / cache
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+
+# Logs
+*.log
+
+# Environment variables (jika ada)
+.env
+
+# ----- Node.js / Nuxt / Express -----
+# Dependencies
+node_modules/
+
+# Build output
+dist/
+.nuxt/
+.out/
+
+# Logs
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# Environment variables
+.env
+.env.local
+
+# ----- System files -----
+.DS_Store
+Thumbs.db
+
+# ----- Optional -----
+# Editor settings (VSCode)
+.vscode/
+.idea/
