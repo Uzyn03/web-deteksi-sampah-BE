@@ -13,9 +13,15 @@ class WasteDetectionService:
         self.session: Optional[ort.InferenceSession] = None
         self.input_name: str = ""
         self.output_name: str = ""
+        # PERBAIKAN: Class mapping berdasarkan hasil evaluasi Google Colab yang benar:
+        # Berdasarkan output evaluasi Anda:
+        # - Sampah Anorganik (Class 0)
+        # - Sampah Organik (Class 1)  
+        # - Sampah-Anorganik (Class 2)
         self.class_names = {
-            0: "organic",      # Sampah organik
-            1: "inorganic"     # Sampah anorganik
+            0: "Sampah Anorganik",    # Class 0 dari model
+            1: "Sampah Organik",      # Class 1 dari model              
+            2: "Sampah-Anorganik"     # Class 2 dari model (mungkin duplikat atau subkategori)
         }
         self.load_model()
     
@@ -36,7 +42,10 @@ class WasteDetectionService:
             self.input_name = self.session.get_inputs()[0].name
             self.output_name = self.session.get_outputs()[0].name
             
-            logger.info(f"Model loaded successfully. Input: {self.input_name}, Output: {self.output_name}")
+            # Log model input/output shapes untuk debugging
+            input_shape = self.session.get_inputs()[0].shape
+            output_shape = self.session.get_outputs()[0].shape
+            logger.info(f"Model loaded successfully. Input: {self.input_name} {input_shape}, Output: {self.output_name} {output_shape}")
             return True
         
         except Exception as e:
@@ -56,11 +65,11 @@ class WasteDetectionService:
         iou_thresh = iou_threshold or settings.iou_threshold
         
         try:
-            model_input, scale = self._preprocess_image(image)
+            model_input, scale, pad_info = self._preprocess_image(image)
             
             outputs = self.session.run([self.output_name], {self.input_name: model_input})
             
-            detections = self._postprocess_outputs(outputs[0], scale, conf_thresh, iou_thresh)
+            detections = self._postprocess_outputs(outputs[0], scale, pad_info, conf_thresh, iou_thresh)
             logger.info(f"Detected {len(detections)} objects")
             return detections
         
@@ -68,88 +77,165 @@ class WasteDetectionService:
             logger.error(f"Detection failed: {e}")
             return []
     
-    def _preprocess_image(self, image: np.ndarray) -> Tuple[np.ndarray, float]:
-        """Resize and normalize image for YOLO ONNX"""
-        height, width = image.shape[:2]
+    def _preprocess_image(self, image: np.ndarray) -> Tuple[np.ndarray, float, Tuple[int, int]]:
+        """Resize and normalize image for YOLO ONNX - sesuai dengan YOLOv8 standard"""
+        original_height, original_width = image.shape[:2]
         target_size = settings.image_size
         
-        scale = min(target_size / width, target_size / height)
-        new_width = int(width * scale)
-        new_height = int(height * scale)
+        # Hitung scaling factor yang sama seperti YOLOv8
+        scale = min(target_size / original_width, target_size / original_height)
+        new_width = int(original_width * scale)
+        new_height = int(original_height * scale)
         
-        resized_image = cv2.resize(image, (new_width, new_height))
+        # Resize dengan INTER_LINEAR (default YOLOv8)
+        resized_image = cv2.resize(image, (new_width, new_height), interpolation=cv2.INTER_LINEAR)
+        
+        # Create padded image dengan nilai 114 (YOLOv8 default)
         padded_image = np.full((target_size, target_size, 3), 114, dtype=np.uint8)
         
-        y_offset = (target_size - new_height) // 2
-        x_offset = (target_size - new_width) // 2
-        padded_image[y_offset:y_offset + new_height, x_offset:x_offset + new_width] = resized_image
+        # Calculate padding - center the image
+        pad_x = (target_size - new_width) // 2
+        pad_y = (target_size - new_height) // 2
         
-        normalized_image = padded_image.astype(np.float32) / 255.0
+        # Place resized image in center
+        padded_image[pad_y:pad_y + new_height, pad_x:pad_x + new_width] = resized_image
+        
+        # IMPORTANT: YOLOv8 expects RGB format, OpenCV loads as BGR
+        # Convert BGR to RGB
+        padded_image_rgb = cv2.cvtColor(padded_image, cv2.COLOR_BGR2RGB)
+        
+        # Normalize to [0, 1] seperti training
+        normalized_image = padded_image_rgb.astype(np.float32) / 255.0
+        
+        # Transpose ke CHW format (Channel, Height, Width)
         model_input = np.transpose(normalized_image, (2, 0, 1))
-        model_input = np.expand_dims(model_input, axis=0)
+        model_input = np.expand_dims(model_input, axis=0)  # Add batch dimension: [1, 3, 640, 640]
         
-        return model_input, scale
+        logger.debug(f"Preprocessing: original({original_width}x{original_height}) -> resized({new_width}x{new_height}) -> padded({target_size}x{target_size})")
+        logger.debug(f"Scale: {scale}, Padding: ({pad_x}, {pad_y})")
+        
+        return model_input, scale, (pad_x, pad_y)
     
-    def _postprocess_outputs(self, outputs: np.ndarray, scale: float, conf_thresh: float, iou_thresh: float) -> List[Dict]:
-        """Convert YOLO raw outputs [1, 6, 8400] to final boxes"""
+    def _postprocess_outputs(self, outputs: np.ndarray, scale: float, pad_info: Tuple[int, int],
+                           conf_thresh: float, iou_thresh: float) -> List[Dict]:
+        """Convert YOLO raw outputs to final boxes - YOLOv8 format"""
         detections = []
-        output = np.squeeze(outputs)  # Shape becomes [6, 8400]
-        preds = output.T              # Transpose to [8400, 6]
+        pad_x, pad_y = pad_info
         
-        logger.debug(f"Shape of preds after transpose: {preds.shape}")
+        # Log shape untuk debugging
+        logger.debug(f"Raw output shape: {outputs.shape}")
         
-        # Assuming the 6 features are: x_center, y_center, w, h, class_prob_0, class_prob_1
-        boxes_raw = preds[:, :4] # x_center, y_center, w, h
-        class_probs = preds[:, 4:] # Probabilities for each class (e.g., [prob_organic, prob_inorganic])
+        # YOLOv8 output format: [1, 4+num_classes, num_anchors]
+        # Untuk 3 kelas: [1, 7, 8400] -> [4 bbox coords + 3 class scores]
+        output = np.squeeze(outputs)  # Remove batch dimension -> [7, 8400]
         
-        # Get the maximum probability (confidence) and the corresponding class ID
+        if output.shape[0] == 7:  # [7, 8400] format untuk 3 kelas
+            preds = output.T  # -> [8400, 7]
+            boxes_raw = preds[:, :4]  # x_center, y_center, w, h
+            class_probs = preds[:, 4:7]  # 3 class probabilities
+        elif output.shape[0] == 6:  # [6, 8400] format untuk 2 kelas
+            preds = output.T  # -> [8400, 6]
+            boxes_raw = preds[:, :4]  # x_center, y_center, w, h
+            class_probs = preds[:, 4:6]  # 2 class probabilities
+        else:
+            logger.error(f"Unexpected output shape: {output.shape}")
+            return []
+        
+        logger.debug(f"Boxes shape: {boxes_raw.shape}, Class probs shape: {class_probs.shape}")
+        
+        # Get confidence scores dan class IDs
         scores = np.max(class_probs, axis=1)
         class_ids = np.argmax(class_probs, axis=1).astype(int)
         
-        logger.debug(f"Raw scores (first 10): {scores[:10]}")
-        logger.debug(f"Raw class_ids (first 10): {class_ids[:10]}")
-        logger.debug(f"Number of initial proposals: {len(scores)}")
+        # DEBUGGING: Print statistik untuk diagnosa
+        logger.info(f"Class probabilities stats:")
+        for class_idx in range(class_probs.shape[1]):
+            class_max = np.max(class_probs[:, class_idx])
+            class_mean = np.mean(class_probs[:, class_idx])
+            class_count = np.sum(class_ids == class_idx)
+            logger.info(f"  Class {class_idx} ({self.class_names.get(class_idx, 'unknown')}): max={class_max:.3f}, mean={class_mean:.3f}, predicted_count={class_count}")
         
-        # Filter by confidence
-        valid_indices = np.where(scores > conf_thresh)[0]
+        logger.debug(f"Overall - Max score: {np.max(scores):.3f}, Min score: {np.min(scores):.3f}")
+        logger.debug(f"Unique class IDs: {np.unique(class_ids)}")
+        
+        # Tampilkan top 10 predictions untuk debugging
+        top_indices = np.argsort(scores)[-10:][::-1]  # Top 10 by confidence
+        logger.info("Top 10 predictions:")
+        for i, idx in enumerate(top_indices):
+            logger.info(f"  {i+1}. Class {class_ids[idx]} ({self.class_names.get(class_ids[idx], 'unknown')}): {scores[idx]:.3f}")
+            logger.info(f"      Raw probs: {class_probs[idx]}")
+        
+        # Filter by confidence threshold
+        valid_indices = np.where(scores >= conf_thresh)[0]
+        
+        if len(valid_indices) == 0:
+            logger.debug(f"No detections above confidence threshold {conf_thresh}")
+            return []
+        
         boxes_raw = boxes_raw[valid_indices]
         scores = scores[valid_indices]
         class_ids = class_ids[valid_indices]
         
-        logger.debug(f"Number of proposals after confidence filter ({conf_thresh}): {len(valid_indices)}")
+        logger.debug(f"After confidence filter: {len(valid_indices)} detections")
         
-        if len(boxes_raw) == 0:
-            return []
-        
-        # Convert to corner format (x1, y1, x2, y2)
+        # Convert dari center format ke corner format dan remove padding
         x_center, y_center, w, h = boxes_raw.T
+        
+        # Remove padding offset
+        x_center = x_center - pad_x
+        y_center = y_center - pad_y
+        
+        # Convert to corner coordinates
         x1 = x_center - w / 2
         y1 = y_center - h / 2
         x2 = x_center + w / 2
         y2 = y_center + h / 2
+        
+        # Scale back ke original image size
+        x1 = x1 / scale
+        y1 = y1 / scale
+        x2 = x2 / scale
+        y2 = y2 / scale
+        
         boxes_corner = np.stack([x1, y1, x2, y2], axis=1)
         
-        # Apply NMS
-        # cv2.dnn.NMSBoxes expects boxes as list of lists, not numpy array
-        indices = cv2.dnn.NMSBoxes(boxes_corner.tolist(), scores.tolist(), conf_thresh, iou_thresh)
-        
-        logger.debug(f"Number of detections after NMS ({iou_thresh}): {len(indices) if len(indices) > 0 else 0}")
-        
-        if len(indices) > 0:
-            for idx in indices.flatten():
-                # Scale back bounding box coordinates to original image size
-                # The scale factor was applied during preprocessing, so we divide by it here
-                x1_orig, y1_orig, x2_orig, y2_orig = boxes_corner[idx] / scale
-                
-                detections.append({
-                    "class_id": int(class_ids[idx]),
-                    "class_name": self.class_names.get(int(class_ids[idx]), "unknown"),
-                    "confidence": float(scores[idx]),
-                    "bbox": [float(x1_orig), float(y1_orig), float(x2_orig), float(y2_orig)]
-                })
+        # Apply Non-Maximum Suppression
+        if len(boxes_corner) > 0:
+            # Convert ke format yang dibutuhkan cv2.dnn.NMSBoxes
+            boxes_list = []
+            for box in boxes_corner:
+                # Convert [x1, y1, x2, y2] ke [x, y, w, h]
+                x, y, w, h = box[0], box[1], box[2] - box[0], box[3] - box[1]
+                boxes_list.append([float(x), float(y), float(w), float(h)])
+            
+            indices = cv2.dnn.NMSBoxes(boxes_list, scores.tolist(), conf_thresh, iou_thresh)
+            
+            logger.debug(f"After NMS: {len(indices) if len(indices) > 0 else 0} detections")
+            
+            if len(indices) > 0:
+                for idx in indices.flatten():
+                    x1_final, y1_final, x2_final, y2_final = boxes_corner[idx]
+                    
+                    # Pastikan koordinat tidak negatif
+                    x1_final = max(0, x1_final)
+                    y1_final = max(0, y1_final)
+                    
+                    detection = {
+                        "class_id": int(class_ids[idx]),
+                        "class_name": self.class_names.get(int(class_ids[idx]), "unknown"),
+                        "confidence": float(scores[idx]),
+                        "bbox": [float(x1_final), float(y1_final), float(x2_final), float(y2_final)]
+                    }
+                    
+                    # DEBUGGING: Log raw class probabilities untuk class ini
+                    raw_probs = class_probs[valid_indices[idx]]
+                    logger.info(f"Final detection - Raw class probabilities: {raw_probs}")
+                    logger.info(f"Predicted class_id: {int(class_ids[idx])}, mapped to: {detection['class_name']}")
+                    
+                    detections.append(detection)
+                    logger.debug(f"Detection: {detection}")
         
         return detections
-
 
 # Global detection service instance
 detection_service = WasteDetectionService()
